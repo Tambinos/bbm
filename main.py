@@ -22,6 +22,8 @@ class LeagueApp:
         self.update_division_table()
 
     def create_widgets(self):
+        for widget in root.winfo_children():
+            widget.destroy()
         # Main Container Frame
         main_frame = tb.Frame(self.root, padding=10)
         main_frame.pack(fill="both", expand=True)
@@ -231,22 +233,28 @@ class LeagueApp:
             return
 
         col_index = int(column[1:]) - 1
+        # Get the bounding box of the cell (for reference, not used in grid)
         x, y, width, height = self.division_table.bbox(item, col_index)
         team_name = self.division_table.item(item, "values")[0]
 
+        # Create the entry widget
         self.edit_entry = Entry(self.division_table)
-        self.edit_entry.place(x=x, y=y, width=width, height=height)
+        self.edit_entry.grid(row=self.division_table.index(item), column=col_index, sticky="nsew")  # Use grid
+
         self.edit_entry.insert(0, team_name)
         self.edit_entry.focus()
 
+        # Bind the events for saving or discarding the changes
         self.edit_entry.bind("<Return>", lambda e: self.save_team_name_edit(item, team_name))
-        self.edit_entry.bind("<FocusOut>", lambda e: self.edit_entry.destroy())
+        self.edit_entry.bind("<FocusOut>", lambda e: self.save_team_name_edit(item, team_name))
+
+        # Configure grid to expand with cell
+        self.division_table.grid_columnconfigure(col_index, weight=1)
+        self.division_table.grid_rowconfigure(self.division_table.index(item), weight=1)
 
     def save_team_name_edit(self, item, old_name):
         new_name = self.edit_entry.get()
         self.edit_entry.destroy()
-        if not new_name or new_name == old_name:
-            return
 
         with self.driver.session() as session:
             session.run("""
@@ -258,8 +266,7 @@ class LeagueApp:
                 MATCH (m:Match)-[r:WINNER|LOSER]->(t:Team {name: $new_name})
                 SET r.team = $new_name
             """, new_name=new_name)
-
-        self.division_table.item(item, values=(new_name,) + self.division_table.item(item, "values")[1:])
+        self.__init__(root)
 
 
 if __name__ == "__main__":
