@@ -19,6 +19,7 @@ class LeagueApp:
 
         self.create_widgets()
         self.update_team_list()
+        self.update_division_table()
 
     def create_widgets(self):
         # Main Container Frame
@@ -92,7 +93,7 @@ class LeagueApp:
         standings_frame = LabelFrame(main_frame, text="League Standings", padding=10)
         standings_frame.grid(row=3, column=0, padx=10, pady=5, sticky="nsew")
 
-        self.selected_division = StringVar(value="Swiss")  # Default selection
+        self.selected_division = StringVar(value="NBA")  # Default selection
 
         radio_frame = tb.Frame(standings_frame)
         radio_frame.pack(pady=5)
@@ -130,6 +131,7 @@ class LeagueApp:
             session.run("CREATE (t:Team {name: $name, division: $division, wins: 0, losses: 0})", name=name,
                         division=division)
         self.update_team_list()
+        self.update_division_table()
 
     def create_player(self):
         name = self.player_name_entry.get()
@@ -148,31 +150,30 @@ class LeagueApp:
             print("Invalid match setup!")  # Add proper UI error handling
             return
 
-        winner = team1 if score1 > score2 else team2
-        loser = team2 if score1 > score2 else team1
+        if score1 > score2:
+            winner, loser = team1, team2
+        elif score2 > score1:
+            winner, loser = team2, team1
+        else:
+            winner, loser = None, None  # Handle draws if needed
 
         with self.driver.session() as session:
-            # Check if the same match already exists
-            match_exists = session.run(
-                "MATCH (m:Match)-[:TEAM1]->(t1:Team {name: $team1})-[:TEAM2]->(t2:Team {name: $team2}) RETURN COUNT(m) AS count",
-                team1=team1, team2=team2
-            ).single()["count"] > 0
-
-            if match_exists:
-                print("This match already exists!")  # Handle in UI
-                return
-
             # Create the match node and relationships
-            session.run("""
-                MATCH (t1:Team {name: $team1}), (t2:Team {name: $team2})
-                CREATE (m:Match {score1: $score1, score2: $score2}) 
-                CREATE (m)-[:TEAM1]->(t1)
-                CREATE (m)-[:TEAM2]->(t2)
-            """, team1=team1, team2=team2, score1=score1, score2=score2)
+            if winner and loser:
+                session.run("""
+                    MATCH (tW:Team {name: $winner}), (tL:Team {name: $loser})
+                    CREATE (m:Match {score1: $score1, score2: $score2})
+                    CREATE (m)-[:WINNER]->(tW)
+                    CREATE (m)-[:LOSER]->(tL)
+                """, winner=winner, loser=loser, score1=score1, score2=score2)
 
-            # Update win/loss counts (ensure fields exist)
-            session.run("MATCH (t:Team {name: $winner}) SET t.wins = COALESCE(t.wins, 0) + 1", winner=winner)
-            session.run("MATCH (t:Team {name: $loser}) SET t.losses = COALESCE(t.losses, 0) + 1", loser=loser)
+                # Update win/loss counts only for matches where both teams are in the same division
+                session.run("""
+                    MATCH (tW:Team {name: $winner})-[:WINNER]->(m:Match)-[:LOSER]->(tL:Team {name: $loser})
+                    WHERE tW.division = tL.division
+                    SET tW.wins = COALESCE(tW.wins, 0) + 1
+                    SET tL.losses = COALESCE(tL.losses, 0) + 1
+                """, winner=winner, loser=loser)
 
         self.update_division_table()
 
@@ -183,14 +184,15 @@ class LeagueApp:
         with self.driver.session() as session:
             result = session.run("""
                 MATCH (t:Team {division: $division})
-                OPTIONAL MATCH (t)-[:TEAM1]->(m:Match)-[:TEAM2]->(opponent:Team)
-                OPTIONAL MATCH (t)<-[:TEAM2]-(m2:Match)-[:TEAM1]->(opponent2:Team)
+                OPTIONAL MATCH (t)<-[:WINNER]-(m:Match)-[:LOSER]->(opponent:Team)
+                WHERE opponent.division = $division
+                OPTIONAL MATCH (t)<-[:LOSER]-(m2:Match)-[:WINNER]->(opponent2:Team)
+                WHERE opponent2.division = $division
                 WITH t, 
-                    SUM(CASE WHEN m.score1 > m.score2 THEN 1 ELSE 0 END) + 
-                    SUM(CASE WHEN m2.score2 > m2.score1 THEN 1 ELSE 0 END) AS wins,
-                    SUM(CASE WHEN m.score1 < m.score2 THEN 1 ELSE 0 END) + 
-                    SUM(CASE WHEN m2.score2 < m2.score1 THEN 1 ELSE 0 END) AS losses
-                RETURN t.name AS team, wins, losses ORDER BY wins DESC
+                     COUNT(DISTINCT m) AS wins, 
+                     COUNT(DISTINCT m2) AS losses
+                RETURN t.name AS team, wins, losses 
+                ORDER BY wins DESC
             """, division=division)
 
             for record in result:
@@ -204,10 +206,16 @@ class LeagueApp:
 
         team_name = self.division_table.item(selected_item, "values")[0]
         with self.driver.session() as session:
+            # Delete all matches where the team is involved
+            session.run("""
+                MATCH (m:Match)-[:WINNER|LOSER]->(t:Team {name: $team_name})
+                DETACH DELETE m
+            """, team_name=team_name)
+
+            # Delete the team itself
             session.run("""
                 MATCH (t:Team {name: $team_name})
-                OPTIONAL MATCH (t)-[r]-()
-                DELETE r, t
+                DETACH DELETE t
             """, team_name=team_name)
 
         self.division_table.delete(selected_item)
@@ -241,9 +249,18 @@ class LeagueApp:
             return
 
         with self.driver.session() as session:
-            session.run("MATCH (t:Team {name: $old_name}) SET t.name = $new_name", old_name=old_name, new_name=new_name)
+            session.run("""
+                MATCH (t:Team {name: $old_name})
+                SET t.name = $new_name
+            """, old_name=old_name, new_name=new_name)
+
+            session.run("""
+                MATCH (m:Match)-[r:WINNER|LOSER]->(t:Team {name: $new_name})
+                SET r.team = $new_name
+            """, new_name=new_name)
 
         self.division_table.item(item, values=(new_name,) + self.division_table.item(item, "values")[1:])
+
 
 if __name__ == "__main__":
     root = tb.Window(themename="superhero")
